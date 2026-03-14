@@ -1,22 +1,21 @@
 """
 Barcode Optimizer
 =================
-Generates an optimal set of N 8-nucleotide barcodes that:
-  1. Have GC content within 40-60% (for 8-nt: 37.5% or 50%, see note below)
+Generates an optimal set of N barcodes of configurable length that:
+  1. Have GC content within 40-60% (±1 base by default for a larger candidate pool)
   2. Maximize the minimum pairwise Hamming distance
   3. Avoid homopolymer runs >= 3
   4. Avoid dinucleotide repeats (e.g., ATATAT, GCGCGC)
   5. Check pairwise sequence complementarity (dimer risk)
   6. Report Levenshtein distance alongside Hamming distance
 
-Note on GC for 8-nt barcodes:
-  Possible GC%: 0, 12.5, 25, 37.5, 50, 62.5, 75, 87.5, 100
-  Strict 40-60% only allows 50% (exactly 4 G/C bases).
-  By default we use 37.5-62.5% (3-5 G/C) for a larger candidate pool.
-  Set --strict to use only 50% GC (4 G/C).
+Note on GC content:
+  By default, GC count is allowed to be ±1 base beyond strict 40-60%,
+  giving a larger candidate pool. Use --strict to enforce exactly 40-60% GC.
 
 Usage:
   python optimize_barcodes.py -n 96
+  python optimize_barcodes.py -n 96 --length 10
   python optimize_barcodes.py -n 96 --strict
   python optimize_barcodes.py -n 96 --restarts 20
 """
@@ -602,13 +601,13 @@ def simulated_annealing(candidates, initial_indices, encoded,
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Optimize 8-nt barcode set for maximum Hamming distance")
+    parser = argparse.ArgumentParser(description="Optimize a barcode set for maximum pairwise distance and minimum complementarity")
     parser.add_argument('-n', '--num-barcodes', type=int, default=96,
                         help='Number of barcodes to generate (default: 96)')
     parser.add_argument('-l', '--length', type=int, default=8,
                         help='Barcode length in nucleotides (default: 8)')
     parser.add_argument('--strict', action='store_true',
-                        help='Strict 40-60%% GC only (for 8-nt, this means exactly 50%%)')
+                        help='Strict GC filter: only barcodes with GC count in [ceil(L*0.4), floor(L*0.6)]')
     parser.add_argument('--max-homopolymer', type=int, default=2,
                         help='Maximum allowed homopolymer run length (default: 2)')
     parser.add_argument('--max-dinuc-repeat', type=int, default=2,
@@ -627,10 +626,17 @@ def main():
                         help='Output file for barcode list (CSV)')
     args = parser.parse_args()
 
+    # Compute GC bounds as integer counts for the given length, then convert to fractions.
+    # This ensures sensible GC ranges for any barcode length.
     if args.strict:
-        gc_min, gc_max = 0.40, 0.60
+        gc_count_min = math.ceil(args.length * 0.40)
+        gc_count_max = math.floor(args.length * 0.60)
     else:
-        gc_min, gc_max = 0.375, 0.625
+        # Allow ±1 GC base beyond strict 40-60% for a larger candidate pool
+        gc_count_min = max(0, math.floor(args.length * 0.40) - 1)
+        gc_count_max = min(args.length, math.ceil(args.length * 0.60) + 1)
+    gc_min = gc_count_min / args.length
+    gc_max = gc_count_max / args.length
 
     print(f"=== Barcode Optimizer ===")
     print(f"  Barcode length:    {args.length} nt")
@@ -667,7 +673,6 @@ def main():
 
     # Step 3: Greedy initialization
     print(f"\nPhase 1: Greedy initialization ({args.restarts} restarts)...")
-    print(f"  Objective: max min_HD -> max min_LD -> min max_CP (lexicographic)")
     base_seed = args.seed if args.seed is not None else random.randint(0, 999999)
 
     best_indices = None
@@ -691,7 +696,6 @@ def main():
 
     # Step 4: Simulated annealing refinement
     print(f"\nPhase 2: Simulated annealing ({args.sa_iterations} iterations)...")
-    print(f"  Objective: max min_HD >> max min_LD >> min max_CP >> max avg_HD >> max avg_LD >> min avg_CP")
     sa_seed = base_seed + args.restarts
     refined_indices, refined_score = simulated_annealing(
         candidates, best_indices, encoded,
@@ -782,8 +786,6 @@ def main():
         print(f"  {'-'*40}")
         for i, j, s1, s2, hd, ld, cp in sorted(low_ld, key=lambda x: x[5]):
             print(f"  {i:<5} {s1:<10} {j:<5} {s2:<10} {hd:>3} {ld:>3}")
-    else:
-        print(f"\n  All pairs have Levenshtein distance >= 3. Good indel tolerance.")
 
     # --- GC Content ---
     gc_vals = [gc_content(s) * 100 for s in selected]
@@ -800,10 +802,9 @@ def main():
     # Step 5: Save to file
     if args.output:
         with open(args.output, 'w') as f:
-            f.write("index,barcode,gc_percent\n")
+            f.write("index,barcode\n")
             for idx, bc in enumerate(selected, 1):
-                gc = gc_content(bc) * 100
-                f.write(f"{idx},{bc},{gc:.1f}\n")
+                f.write(f"{idx},{bc}\n")
         print(f"\nSaved to {args.output}")
 
 

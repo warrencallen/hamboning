@@ -253,20 +253,176 @@ def compute_primer_complementarity(seq, primers):
     return max_cp
 
 
+@njit(cache=True)
+def _batch_primer_complementarity(encoded_all, primer_arrs, primer_lens, comp_table, n_cand, n_primers):
+    """Compute max primer complementarity for all candidates using numba."""
+    result = np.zeros(n_cand, dtype=np.int16)
+    for i in range(n_cand):
+        max_cp = 0
+        for p in range(n_primers):
+            primer_p = primer_arrs[p, :primer_lens[p]]
+            cp = max_complementarity_nb(encoded_all[i], primer_p, comp_table)
+            if cp > max_cp:
+                max_cp = cp
+        result[i] = max_cp
+    return result
+
+
+@njit(cache=True)
+def _generate_candidates_nb(length, gc_count_min, gc_count_max, max_homopolymer, max_dinuc_repeat):
+    """Numba-accelerated DFS candidate generation with pruning.
+
+    Uses an iterative DFS with fixed-size state arrays (no Python objects).
+    Tracks GC count, homopolymer runs, and even/odd-aligned dinucleotide
+    repeat chains at each tree level for O(1) constraint checking.
+    """
+    # Pre-allocate output buffer (generous upper bound, will trim)
+    max_out = 1_000_000
+    result = np.empty((max_out, length), dtype=np.int8)
+    count = 0
+
+    # State arrays indexed by position (tree level)
+    seq = np.zeros(length, dtype=np.int8)
+    next_base = np.zeros(length, dtype=np.int8)  # Which base to try next
+    gc = np.zeros(length + 1, dtype=np.int32)     # Running GC count
+    run = np.ones(length + 1, dtype=np.int32)      # Homopolymer run length
+    # Even/odd aligned dinucleotide chain tracking
+    ch_even_cnt = np.zeros(length + 1, dtype=np.int32)
+    ch_even_d0 = np.full(length + 1, -1, dtype=np.int8)
+    ch_even_d1 = np.full(length + 1, -1, dtype=np.int8)
+    ch_odd_cnt = np.zeros(length + 1, dtype=np.int32)
+    ch_odd_d0 = np.full(length + 1, -1, dtype=np.int8)
+    ch_odd_d1 = np.full(length + 1, -1, dtype=np.int8)
+
+    pos = 0
+    next_base[0] = 0
+
+    while pos >= 0:
+        if pos == length:
+            # Valid candidate found
+            if count >= max_out:
+                new_result = np.empty((max_out * 2, length), dtype=np.int8)
+                for i in range(max_out):
+                    new_result[i] = result[i]
+                result = new_result
+                max_out *= 2
+            for i in range(length):
+                result[count, i] = seq[i]
+            count += 1
+            pos -= 1
+            continue
+
+        b = next_base[pos]
+        if b >= 4:
+            # Exhausted all bases, backtrack
+            next_base[pos] = 0
+            pos -= 1
+            continue
+
+        next_base[pos] = b + 1
+        seq[pos] = b
+
+        # GC bounds pruning
+        new_gc = gc[pos] + (1 if (b == 1 or b == 2) else 0)
+        remaining = length - pos - 1
+        if new_gc + remaining < gc_count_min:
+            continue
+        if new_gc > gc_count_max:
+            continue
+        gc[pos + 1] = new_gc
+
+        # Homopolymer pruning
+        if pos > 0 and b == seq[pos - 1]:
+            new_run = run[pos] + 1
+            if new_run > max_homopolymer:
+                continue
+        else:
+            new_run = 1
+        run[pos + 1] = new_run
+
+        # Dinucleotide repeat pruning (O(1) per step)
+        new_ch_even_cnt = ch_even_cnt[pos]
+        new_ch_even_d0 = ch_even_d0[pos]
+        new_ch_even_d1 = ch_even_d1[pos]
+        new_ch_odd_cnt = ch_odd_cnt[pos]
+        new_ch_odd_d0 = ch_odd_d0[pos]
+        new_ch_odd_d1 = ch_odd_d1[pos]
+
+        skip = False
+        if pos >= 1:
+            d0 = seq[pos - 1]
+            d1 = b
+            if d0 != d1:  # Non-homopolymer dinuc
+                if pos % 2 == 1:  # pos-1 is even → even-aligned
+                    if d0 == new_ch_even_d0 and d1 == new_ch_even_d1:
+                        new_ch_even_cnt = ch_even_cnt[pos] + 1
+                    else:
+                        new_ch_even_cnt = 1
+                        new_ch_even_d0 = d0
+                        new_ch_even_d1 = d1
+                    if new_ch_even_cnt > max_dinuc_repeat:
+                        skip = True
+                else:  # pos-1 is odd → odd-aligned
+                    if d0 == new_ch_odd_d0 and d1 == new_ch_odd_d1:
+                        new_ch_odd_cnt = ch_odd_cnt[pos] + 1
+                    else:
+                        new_ch_odd_cnt = 1
+                        new_ch_odd_d0 = d0
+                        new_ch_odd_d1 = d1
+                    if new_ch_odd_cnt > max_dinuc_repeat:
+                        skip = True
+            else:
+                # Homopolymer dinuc breaks chain at this alignment
+                if pos % 2 == 1:
+                    new_ch_even_cnt = 0
+                    new_ch_even_d0 = -1
+                    new_ch_even_d1 = -1
+                else:
+                    new_ch_odd_cnt = 0
+                    new_ch_odd_d0 = -1
+                    new_ch_odd_d1 = -1
+        if skip:
+            continue
+
+        ch_even_cnt[pos + 1] = new_ch_even_cnt
+        ch_even_d0[pos + 1] = new_ch_even_d0
+        ch_even_d1[pos + 1] = new_ch_even_d1
+        ch_odd_cnt[pos + 1] = new_ch_odd_cnt
+        ch_odd_d0[pos + 1] = new_ch_odd_d0
+        ch_odd_d1[pos + 1] = new_ch_odd_d1
+
+        pos += 1
+
+    return result[:count]
+
+
+_CHAR_LOOKUP = np.array([ord('A'), ord('C'), ord('G'), ord('T')], dtype=np.uint8)
+
+
 def generate_candidates(length=8, gc_min=0.375, gc_max=0.625, max_homopolymer=2, max_dinuc_repeat=2):
-    """Generate all valid barcode candidates meeting GC, homopolymer, and dinucleotide constraints."""
-    candidates = []
-    for bases in product('ACGT', repeat=length):
-        seq = ''.join(bases)
-        gc = gc_content(seq)
-        if gc < gc_min or gc > gc_max:
-            continue
-        if has_homopolymer(seq, max_homopolymer):
-            continue
-        if has_dinucleotide_repeat(seq, max_dinuc_repeat):
-            continue
-        candidates.append(seq)
-    return candidates
+    """Generate all valid barcode candidates using numba-accelerated DFS with pruning.
+
+    Returns (candidates_strings, encoded_array) tuple.
+    For large candidate pools, string conversion uses vectorized numpy operations.
+    """
+    # Compute integer GC count bounds
+    gc_count_min = 0
+    gc_count_max = length
+    for gc in range(length + 1):
+        if gc / length >= gc_min:
+            gc_count_min = gc
+            break
+    for gc in range(length, -1, -1):
+        if gc / length <= gc_max:
+            gc_count_max = gc
+            break
+
+    encoded = _generate_candidates_nb(length, gc_count_min, gc_count_max, max_homopolymer, max_dinuc_repeat)
+    # Fast vectorized string conversion
+    char_codes = _CHAR_LOOKUP[encoded]
+    fmt = f'S{length}'
+    candidates = char_codes.view(fmt).ravel().astype(f'U{length}').tolist()
+    return candidates, encoded
 
 
 def compute_distance_matrix(candidates):
@@ -379,11 +535,9 @@ def evaluate_set_hd(encoded, indices):
     return min_hd
 
 
-def evaluate_set_full(candidates, indices, primer_cp=None):
-    """Evaluate a barcode set with the full objective.
-    Returns (min_hd, min_ld, max_cp, max_primer_cp, mean_hd, mean_ld, mean_cp, mean_primer_cp) tuple."""
-    seqs = [candidates[i] for i in indices]
-    n = len(seqs)
+@njit(cache=True)
+def _evaluate_set_full_nb(encoded, indices, n_sel, comp_table):
+    """Numba-accelerated full set evaluation."""
     min_hd = 999
     min_ld = 999
     max_cp = 0
@@ -391,11 +545,13 @@ def evaluate_set_full(candidates, indices, primer_cp=None):
     sum_ld = 0
     sum_cp = 0
     count = 0
-    for i in range(n):
-        for j in range(i + 1, n):
-            hd = hamming(seqs[i], seqs[j])
-            ld = levenshtein(seqs[i], seqs[j])
-            cp = max_complementarity(seqs[i], seqs[j])
+    for i in range(n_sel):
+        si = encoded[indices[i]]
+        for j in range(i + 1, n_sel):
+            sj = encoded[indices[j]]
+            hd = hamming_nb(si, sj)
+            ld = levenshtein_nb(si, sj)
+            cp = max_complementarity_nb(si, sj, comp_table)
             if hd < min_hd:
                 min_hd = hd
             if ld < min_ld:
@@ -406,6 +562,44 @@ def evaluate_set_full(candidates, indices, primer_cp=None):
             sum_ld += ld
             sum_cp += cp
             count += 1
+    return min_hd, min_ld, max_cp, sum_hd, sum_ld, sum_cp, count
+
+
+def evaluate_set_full(candidates, indices, primer_cp=None, encoded_nb=None):
+    """Evaluate a barcode set with the full objective.
+    Returns (min_hd, min_ld, max_cp, max_primer_cp, mean_hd, mean_ld, mean_cp, mean_primer_cp) tuple.
+    Uses numba acceleration when encoded_nb is provided."""
+    if encoded_nb is not None:
+        indices_arr = np.array(indices, dtype=np.int32)
+        min_hd, min_ld, max_cp, sum_hd, sum_ld, sum_cp, count = _evaluate_set_full_nb(
+            encoded_nb, indices_arr, len(indices), _COMP_TABLE)
+        min_hd, min_ld, max_cp = int(min_hd), int(min_ld), int(max_cp)
+        sum_hd, sum_ld, sum_cp, count = int(sum_hd), int(sum_ld), int(sum_cp), int(count)
+    else:
+        seqs = [candidates[i] for i in indices]
+        n = len(seqs)
+        min_hd = 999
+        min_ld = 999
+        max_cp = 0
+        sum_hd = 0
+        sum_ld = 0
+        sum_cp = 0
+        count = 0
+        for i in range(n):
+            for j in range(i + 1, n):
+                hd = hamming(seqs[i], seqs[j])
+                ld = levenshtein(seqs[i], seqs[j])
+                cp = max_complementarity(seqs[i], seqs[j])
+                if hd < min_hd:
+                    min_hd = hd
+                if ld < min_ld:
+                    min_ld = ld
+                if cp > max_cp:
+                    max_cp = cp
+                sum_hd += hd
+                sum_ld += ld
+                sum_cp += cp
+                count += 1
     # Primer complementarity metrics
     if primer_cp is not None:
         pcp_vals = [int(primer_cp[i]) for i in indices]
@@ -441,6 +635,25 @@ def compute_pair_metrics_for_idx(seq, other_seqs):
         if cp > max_cp:
             max_cp = cp
     return (min_hd, min_ld, max_cp)
+
+
+@njit(cache=True)
+def _compute_all_pairs_nb(encoded, indices, n_sel, comp_table):
+    """Compute all pairwise HD, LD, CP for selected barcodes. Returns flat arrays."""
+    n_pairs = n_sel * (n_sel - 1) // 2
+    all_hd = np.empty(n_pairs, dtype=np.int32)
+    all_ld = np.empty(n_pairs, dtype=np.int32)
+    all_cp = np.empty(n_pairs, dtype=np.int32)
+    k = 0
+    for i in range(n_sel):
+        si = encoded[indices[i]]
+        for j in range(i + 1, n_sel):
+            sj = encoded[indices[j]]
+            all_hd[k] = hamming_nb(si, sj)
+            all_ld[k] = levenshtein_nb(si, sj)
+            all_cp[k] = max_complementarity_nb(si, sj, comp_table)
+            k += 1
+    return all_hd, all_ld, all_cp
 
 
 def score_to_scalar(score):
@@ -972,38 +1185,6 @@ def main():
     print(f"  Tabu-LNS iters:    {args.iterations}")
     print()
 
-    # Step 1: Generate candidate pool
-    print("Generating candidate barcodes...", end=" ", flush=True)
-    t0 = time.time()
-    candidates = generate_candidates(
-        length=args.length,
-        gc_min=gc_min,
-        gc_max=gc_max,
-        max_homopolymer=args.max_homopolymer,
-        max_dinuc_repeat=args.max_dinuc_repeat,
-    )
-    t1 = time.time()
-    print(f"{len(candidates)} candidates in {t1-t0:.1f}s")
-
-    if len(candidates) < args.num_barcodes:
-        print(f"ERROR: Only {len(candidates)} candidates available, cannot select {args.num_barcodes}.")
-        sys.exit(1)
-
-    # Precompute primer complementarity for all candidates
-    primer_cp_arr = None
-    if primers:
-        print("Computing primer complementarity for all candidates...", end=" ", flush=True)
-        t_pcp = time.time()
-        primer_cp_arr = np.array([compute_primer_complementarity(c, primers) for c in candidates], dtype=np.int16)
-        print(f"done in {time.time()-t_pcp:.1f}s (max={int(np.max(primer_cp_arr))}, mean={np.mean(primer_cp_arr):.1f})")
-
-    # Step 2: Encode for fast distance computation
-    print("Encoding sequences...", end=" ", flush=True)
-    encoded = compute_distance_matrix(candidates)
-    # Also create int8 array for numba functions
-    encoded_nb = np.array([[_BASE_MAP[c] for c in seq] for seq in candidates], dtype=np.int8)
-    print("done")
-
     # Warm up numba JIT (first call triggers compilation)
     print("JIT compiling numba kernels...", end=" ", flush=True)
     t_jit = time.time()
@@ -1011,10 +1192,47 @@ def main():
     hamming_nb(_dummy, _dummy)
     levenshtein_nb(_dummy, _dummy)
     max_complementarity_nb(_dummy, _dummy, _COMP_TABLE)
-    _batch_levenshtein_update(encoded_nb[:2], encoded_nb[0], np.full(2, 999, dtype=np.int16), np.zeros(2, dtype=np.bool_), 2)
-    _batch_complementarity_update(encoded_nb[:2], encoded_nb[0], np.zeros(2, dtype=np.int16), np.zeros(2, dtype=np.bool_), 2, _COMP_TABLE)
-    _sa_compute_new_pairs(encoded_nb[:2], encoded_nb[0], np.array([0, 1], dtype=np.int32), 0, 2, _COMP_TABLE)
+    _enc2 = np.array([[0,1,2,3],[1,2,3,0]], dtype=np.int8)
+    _batch_levenshtein_update(_enc2, _enc2[0], np.full(2, 999, dtype=np.int16), np.zeros(2, dtype=np.bool_), 2)
+    _batch_complementarity_update(_enc2, _enc2[0], np.zeros(2, dtype=np.int16), np.zeros(2, dtype=np.bool_), 2, _COMP_TABLE)
+    _sa_compute_new_pairs(_enc2, _enc2[0], np.array([0, 1], dtype=np.int32), 0, 2, _COMP_TABLE)
+    _evaluate_set_full_nb(_enc2, np.array([0, 1], dtype=np.int32), 2, _COMP_TABLE)
+    _compute_all_pairs_nb(_enc2, np.array([0, 1], dtype=np.int32), 2, _COMP_TABLE)
+    _batch_primer_complementarity(_enc2, _enc2[:1], np.array([_enc2.shape[1]], dtype=np.int32), _COMP_TABLE, 2, 1)
+    _generate_candidates_nb(4, 1, 3, 2, 2)  # Warm up candidate generator
     print(f"done in {time.time()-t_jit:.1f}s")
+
+    # Step 1: Generate candidate pool (returns both strings and encoded array)
+    print("Generating candidate barcodes...", end=" ", flush=True)
+    t0 = time.time()
+    candidates, encoded_nb = generate_candidates(
+        length=args.length,
+        gc_min=gc_min,
+        gc_max=gc_max,
+        max_homopolymer=args.max_homopolymer,
+        max_dinuc_repeat=args.max_dinuc_repeat,
+    )
+    encoded = encoded_nb  # Same array works for both vectorized and numba operations
+    t1 = time.time()
+    print(f"{len(candidates)} candidates in {t1-t0:.1f}s")
+
+    if len(candidates) < args.num_barcodes:
+        print(f"ERROR: Only {len(candidates)} candidates available, cannot select {args.num_barcodes}.")
+        sys.exit(1)
+
+    # Precompute primer complementarity for all candidates (using numba)
+    primer_cp_arr = None
+    if primers:
+        print("Computing primer complementarity for all candidates...", end=" ", flush=True)
+        t_pcp = time.time()
+        primer_raw = [seq_to_arr(p) for p in primers]
+        max_plen = max(len(a) for a in primer_raw)
+        primer_arrs = np.zeros((len(primer_raw), max_plen), dtype=np.int8)
+        primer_lens = np.array([len(a) for a in primer_raw], dtype=np.int32)
+        for i, a in enumerate(primer_raw):
+            primer_arrs[i, :len(a)] = a
+        primer_cp_arr = _batch_primer_complementarity(encoded_nb, primer_arrs, primer_lens, _COMP_TABLE, len(candidates), len(primers))
+        print(f"done in {time.time()-t_pcp:.1f}s (max={int(np.max(primer_cp_arr))}, mean={np.mean(primer_cp_arr):.1f})")
 
     # Step 3: Greedy initialization
     print(f"\nPhase 1: Greedy initialization ({args.restarts} restarts)...")
@@ -1035,7 +1253,7 @@ def main():
     def _run_greedy_restart(r):
         seed = base_seed + r
         indices, _ = greedy_select(candidates, encoded, args.num_barcodes, seed=seed, primer_cp=primer_cp_arr, encoded_nb=encoded_nb)
-        score = evaluate_set_full(candidates, indices, primer_cp=primer_cp_arr)
+        score = evaluate_set_full(candidates, indices, primer_cp=primer_cp_arr, encoded_nb=encoded_nb)
         return r, indices, score
 
     for r in range(args.restarts):
@@ -1069,20 +1287,23 @@ def main():
     from collections import Counter
 
     print("\nComputing pairwise Hamming & Levenshtein distances...", end=" ", flush=True)
-    all_hd = []
-    all_ld = []
-    all_cp = []
-    pair_data = []  # (i_name, j_name, s1, s2, hd, ld, cp)
-    for i, j in combinations(range(len(selected)), 2):
-        s1, s2 = selected[i], selected[j]
-        hd = hamming(s1, s2)
-        ld = levenshtein(s1, s2)
-        cp = max_complementarity(s1, s2)
-        all_hd.append(hd)
-        all_ld.append(ld)
-        all_cp.append(cp)
-        pair_data.append((i+1, j+1, s1, s2, hd, ld, cp))
-    print("done")
+    t_stats = time.time()
+    refined_indices_arr = np.array(refined_indices, dtype=np.int32)
+    hd_flat, ld_flat, cp_flat = _compute_all_pairs_nb(
+        encoded_nb, refined_indices_arr, len(refined_indices), _COMP_TABLE)
+    all_hd = hd_flat.tolist()
+    all_ld = ld_flat.tolist()
+    all_cp = cp_flat.tolist()
+    # Build pair_data for flagging
+    pair_data = []
+    k = 0
+    n_final = len(selected)
+    for i in range(n_final):
+        for j in range(i + 1, n_final):
+            pair_data.append((i+1, j+1, selected[i], selected[j],
+                            all_hd[k], all_ld[k], all_cp[k]))
+            k += 1
+    print(f"done in {time.time()-t_stats:.1f}s")
 
     hd_counter = Counter(all_hd)
     ld_counter = Counter(all_ld)
@@ -1144,7 +1365,7 @@ def main():
     # --- Primer Complementarity ---
     if primers:
         print(f"\n  PRIMER COMPLEMENTARITY (non-specific binding risk)")
-        pcp_vals = [compute_primer_complementarity(s, primers) for s in selected]
+        pcp_vals = [int(primer_cp_arr[i]) for i in refined_indices]
         print(f"  Max primer complementarity: {max(pcp_vals)} bp")
         print(f"  Mean primer complementarity: {sum(pcp_vals)/len(pcp_vals):.2f} bp")
         pcp_counter = Counter(pcp_vals)

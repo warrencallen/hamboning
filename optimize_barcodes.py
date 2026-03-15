@@ -8,27 +8,162 @@ Generates an optimal set of N barcodes of configurable length that:
   4. Avoid dinucleotide repeats (e.g., ATATAT, GCGCGC)
   5. Check pairwise sequence complementarity (dimer risk)
   6. Report Levenshtein distance alongside Hamming distance
+  7. Minimize complementarity to user-supplied primer sequences (soft blacklist)
 
 Note on GC content:
   By default, GC count is allowed to be ±1 base beyond strict 40-60%,
   giving a larger candidate pool. Use --strict to enforce exactly 40-60% GC.
+
+Primer blacklist:
+  Use --primers to supply primer sequences (comma-separated). The optimizer
+  will penalize barcodes that have high complementarity to any primer,
+  reducing the risk of non-specific primer-barcode binding.
 
 Usage:
   python optimize_barcodes.py -n 96
   python optimize_barcodes.py -n 96 --length 10
   python optimize_barcodes.py -n 96 --strict
   python optimize_barcodes.py -n 96 --restarts 20
+  python optimize_barcodes.py -n 96 --primers ATCGATCG,GCTAGCTA
 """
 
 import argparse
 import math
+import multiprocessing
+import os
 import random
 import sys
 import time
 from itertools import product
 
 import numpy as np
+from numba import njit, int8, int16, int32
 
+# --- Numba-accelerated core functions ---
+
+# Complement table: A(0)->T(3), C(1)->G(2), G(2)->C(1), T(3)->A(0)
+_COMP_TABLE = np.array([3, 2, 1, 0], dtype=np.int8)
+_BASE_MAP = {'A': 0, 'C': 1, 'G': 2, 'T': 3}
+_BASE_UNMAP = ['A', 'C', 'G', 'T']
+
+
+def seq_to_arr(seq):
+    """Convert a DNA string to a numpy int8 array."""
+    return np.array([_BASE_MAP[c] for c in seq], dtype=np.int8)
+
+
+def arr_to_seq(arr):
+    """Convert a numpy int8 array back to a DNA string."""
+    return ''.join(_BASE_UNMAP[i] for i in arr)
+
+
+@njit(int32(int8[:], int8[:]), cache=True)
+def hamming_nb(s1, s2):
+    """Hamming distance between two encoded sequences."""
+    d = 0
+    for i in range(len(s1)):
+        if s1[i] != s2[i]:
+            d += 1
+    return d
+
+
+@njit(int32(int8[:], int8[:]), cache=True)
+def levenshtein_nb(s1, s2):
+    """Levenshtein distance between two encoded sequences."""
+    n = len(s1)
+    m = len(s2)
+    # Use a single row DP
+    dp = np.empty(m + 1, dtype=np.int32)
+    for j in range(m + 1):
+        dp[j] = j
+    for i in range(1, n + 1):
+        prev = dp[0]
+        dp[0] = i
+        for j in range(1, m + 1):
+            temp = dp[j]
+            if s1[i-1] == s2[j-1]:
+                dp[j] = prev
+            else:
+                val = prev
+                if dp[j] < val:
+                    val = dp[j]
+                if dp[j-1] < val:
+                    val = dp[j-1]
+                dp[j] = 1 + val
+            prev = temp
+    return dp[m]
+
+
+@njit(int8[:](int8[:], int8[:]), cache=True)
+def _reverse_complement_nb(seq, comp_table):
+    """Return the reverse complement of an encoded sequence."""
+    n = len(seq)
+    rc = np.empty(n, dtype=np.int8)
+    for i in range(n):
+        rc[i] = comp_table[seq[n - 1 - i]]
+    return rc
+
+
+@njit(int32(int8[:], int8[:], int8[:]), cache=True)
+def max_complementarity_nb(s1, s2, comp_table):
+    """Max Watson-Crick base pairs across sliding alignments (min overlap 3)."""
+    rc2 = _reverse_complement_nb(s2, comp_table)
+    l1 = len(s1)
+    l2 = len(rc2)
+    max_bp = 0
+    for offset in range(-(l1 - 3), l1 - 2):
+        bp = 0
+        for i in range(l1):
+            j = i - offset
+            if 0 <= j < l2:
+                if s1[i] == rc2[j]:
+                    bp += 1
+        if bp > max_bp:
+            max_bp = bp
+    return max_bp
+
+
+@njit(cache=True)
+def _batch_levenshtein_update(encoded_all, new_seq, min_ld_to_set, selected_mask, n_cand):
+    """Update min_ld_to_set for all unselected candidates against new_seq."""
+    for i in range(n_cand):
+        if selected_mask[i]:
+            continue
+        ld = levenshtein_nb(encoded_all[i], new_seq)
+        if ld < min_ld_to_set[i]:
+            min_ld_to_set[i] = ld
+
+
+@njit(cache=True)
+def _batch_complementarity_update(encoded_all, new_seq, max_cp_to_set, selected_mask, n_cand, comp_table):
+    """Update max_cp_to_set for all unselected candidates against new_seq."""
+    for i in range(n_cand):
+        if selected_mask[i]:
+            continue
+        cp = max_complementarity_nb(encoded_all[i], new_seq, comp_table)
+        if cp > max_cp_to_set[i]:
+            max_cp_to_set[i] = cp
+
+
+@njit(cache=True)
+def _sa_compute_new_pairs(encoded_all, new_seq, selected, pos, n_sel, comp_table):
+    """Compute HD, LD, CP for new_seq against all other selected barcodes."""
+    new_hd = np.empty(n_sel - 1, dtype=np.int16)
+    new_ld = np.empty(n_sel - 1, dtype=np.int16)
+    new_cp = np.empty(n_sel - 1, dtype=np.int16)
+    k = 0
+    for j in range(n_sel):
+        if j == pos:
+            continue
+        other = encoded_all[selected[j]]
+        new_hd[k] = hamming_nb(new_seq, other)
+        new_ld[k] = levenshtein_nb(new_seq, other)
+        new_cp[k] = max_complementarity_nb(new_seq, other, comp_table)
+        k += 1
+    return new_hd, new_ld, new_cp
+
+
+# --- Python wrapper functions (for string-based API compatibility) ---
 
 def gc_content(seq):
     return (seq.count('G') + seq.count('C')) / len(seq)
@@ -48,11 +183,10 @@ def has_homopolymer(seq, max_run=2):
 
 
 def has_dinucleotide_repeat(seq, max_repeat=2):
-    """Return True if seq contains a dinucleotide repeated more than max_repeat times.
-    E.g., ATATAT = 3 repeats of AT; max_repeat=2 would flag this."""
+    """Return True if seq contains a dinucleotide repeated more than max_repeat times."""
     for i in range(len(seq) - 1):
         dinuc = seq[i:i+2]
-        if dinuc[0] == dinuc[1]:  # Skip homopolymer dinucs (handled separately)
+        if dinuc[0] == dinuc[1]:
             continue
         count = 1
         pos = i + 2
@@ -93,12 +227,10 @@ def reverse_complement(seq):
 
 def max_complementarity(s1, s2):
     """Compute maximum number of Watson-Crick base pairs between s1 and the
-    reverse complement of s2, across all sliding alignments with min overlap of 3.
-    This measures dimer formation potential."""
+    reverse complement of s2, across all sliding alignments with min overlap of 3."""
     rc2 = reverse_complement(s2)
     l = len(s1)
     max_bp = 0
-    # Slide rc2 across s1 with min overlap of 3
     for offset in range(-(l - 3), l - 2):
         bp = 0
         for i in range(l):
@@ -109,6 +241,16 @@ def max_complementarity(s1, s2):
         if bp > max_bp:
             max_bp = bp
     return max_bp
+
+
+def compute_primer_complementarity(seq, primers):
+    """Compute maximum complementarity between seq and any primer sequence."""
+    max_cp = 0
+    for primer in primers:
+        cp = max_complementarity(seq, primer)
+        if cp > max_cp:
+            max_cp = cp
+    return max_cp
 
 
 def generate_candidates(length=8, gc_min=0.375, gc_max=0.625, max_homopolymer=2, max_dinuc_repeat=2):
@@ -138,18 +280,10 @@ def compute_distance_matrix(candidates):
     return encoded
 
 
-def greedy_select(candidates, encoded, n_barcodes, seed=None):
+def greedy_select(candidates, encoded, n_barcodes, seed=None, primer_cp=None, encoded_nb=None):
     """
     Unified multi-objective greedy selection.
-    At each step, picks the candidate that yields the best lexicographic
-    score (max min_HD, max min_LD, min max_CP) for the resulting set.
-
-    Tracks per-candidate:
-      - min_hd_to_set: minimum Hamming distance to any selected barcode
-      - min_ld_to_set: minimum Levenshtein distance to any selected barcode
-      - max_cp_to_set: maximum complementarity to any selected barcode
-
-    Uses HD as a fast pre-filter (numpy) before computing expensive LD/CP.
+    Uses numba-accelerated functions for LD and CP computation.
     """
     rng = random.Random(seed)
     n_cand = len(candidates)
@@ -157,67 +291,46 @@ def greedy_select(candidates, encoded, n_barcodes, seed=None):
     # Start with a random barcode
     start_idx = rng.randint(0, n_cand - 1)
     selected_indices = [start_idx]
-    selected_set = {start_idx}
+    selected_mask = np.zeros(n_cand, dtype=np.bool_)
+    selected_mask[start_idx] = True
 
     # Initialize per-candidate tracking arrays
-    # HD via numpy (fast)
     min_hd_to_set = np.sum(encoded != encoded[start_idx], axis=1).astype(np.int16)
-    # LD and CP via Python (only computed for viable candidates)
     min_ld_to_set = np.full(n_cand, 999, dtype=np.int16)
     max_cp_to_set = np.zeros(n_cand, dtype=np.int16)
 
-    start_seq = candidates[start_idx]
-    for i in range(n_cand):
-        if i == start_idx:
-            continue
-        min_ld_to_set[i] = levenshtein(candidates[i], start_seq)
-        max_cp_to_set[i] = max_complementarity(candidates[i], start_seq)
+    # Use numba batch functions for initial LD/CP computation
+    start_seq_arr = encoded_nb[start_idx]
+    _batch_levenshtein_update(encoded_nb, start_seq_arr, min_ld_to_set, selected_mask, n_cand)
+    _batch_complementarity_update(encoded_nb, start_seq_arr, max_cp_to_set, selected_mask, n_cand, _COMP_TABLE)
 
-    # Global score of current set (only matters after >= 2 barcodes)
     global_min_hd = 999
     global_min_ld = 999
     global_max_cp = 0
+    global_max_primer_cp = int(primer_cp[start_idx]) if primer_cp is not None else 0
 
     for step in range(1, n_barcodes):
-        # For each unselected candidate, compute what the set score would be
-        # if we added it:
-        #   would_min_hd = min(global_min_hd, min_hd_to_set[i])
-        #   would_min_ld = min(global_min_ld, min_ld_to_set[i])
-        #   would_max_cp = max(global_max_cp, max_cp_to_set[i])
-        # Pick best lexicographic (max would_min_hd, max would_min_ld, min would_max_cp)
-
         best_idx = -1
-        best_would = (-1, -1, 999)  # (would_min_hd, would_min_ld, -would_max_cp proxy)
+        best_would = (-1, -1, 999, 999)
 
-        # Pre-filter: only consider candidates with min_hd_to_set >= some threshold
-        # First pass: find the max achievable min_hd
         temp_hd = min_hd_to_set.copy()
-        for idx in selected_set:
-            temp_hd[idx] = -1
+        temp_hd[selected_mask] = -1
         max_achievable_hd = int(np.max(temp_hd))
 
         if max_achievable_hd <= 0:
             print(f"  Warning: Could not find {n_barcodes} barcodes with HD > 0. Stopped at {step}.")
             break
 
-        # The best possible would_min_hd = min(global_min_hd, max_achievable_hd)
-        # We only need candidates whose min_hd_to_set >= min(global_min_hd, max_achievable_hd)
-        # to have any chance of being optimal on the HD axis.
-        # But we also want to explore candidates that tie on HD but win on LD/CP.
-        # Strategy: consider all candidates with min_hd_to_set >= best HD threshold
         target_hd = min(global_min_hd, max_achievable_hd) if step > 1 else max_achievable_hd
-
-        # Get viable candidates
-        viable_mask = (temp_hd >= target_hd)
-        viable_indices = np.where(viable_mask)[0]
+        viable_indices = np.where(temp_hd >= target_hd)[0]
 
         for i in viable_indices:
             would_min_hd = min(global_min_hd, int(min_hd_to_set[i])) if step > 1 else int(min_hd_to_set[i])
             would_min_ld = min(global_min_ld, int(min_ld_to_set[i])) if step > 1 else int(min_ld_to_set[i])
             would_max_cp = max(global_max_cp, int(max_cp_to_set[i])) if step > 1 else int(max_cp_to_set[i])
+            would_max_pcp = max(global_max_primer_cp, int(primer_cp[i])) if primer_cp is not None else 0
 
-            # Lexicographic comparison: max hd, max ld, min cp
-            cand_score = (would_min_hd, would_min_ld, -would_max_cp)
+            cand_score = (would_min_hd, would_min_ld, -would_max_cp, -would_max_pcp)
             if cand_score > best_would:
                 best_would = cand_score
                 best_idx = int(i)
@@ -227,9 +340,8 @@ def greedy_select(candidates, encoded, n_barcodes, seed=None):
             break
 
         selected_indices.append(best_idx)
-        selected_set.add(best_idx)
+        selected_mask[best_idx] = True
 
-        # Update global score
         if step == 1:
             global_min_hd = int(min_hd_to_set[best_idx])
             global_min_ld = int(min_ld_to_set[best_idx])
@@ -238,21 +350,16 @@ def greedy_select(candidates, encoded, n_barcodes, seed=None):
             global_min_hd = min(global_min_hd, int(min_hd_to_set[best_idx]))
             global_min_ld = min(global_min_ld, int(min_ld_to_set[best_idx]))
             global_max_cp = max(global_max_cp, int(max_cp_to_set[best_idx]))
+        if primer_cp is not None:
+            global_max_primer_cp = max(global_max_primer_cp, int(primer_cp[best_idx]))
 
-        # Update per-candidate arrays with distances to the newly added barcode
-        new_seq = candidates[best_idx]
+        # Update per-candidate arrays with numba-accelerated batch functions
         new_hd = np.sum(encoded != encoded[best_idx], axis=1).astype(np.int16)
         min_hd_to_set = np.minimum(min_hd_to_set, new_hd)
 
-        for i in range(n_cand):
-            if i in selected_set:
-                continue
-            ld = levenshtein(candidates[i], new_seq)
-            if ld < min_ld_to_set[i]:
-                min_ld_to_set[i] = ld
-            cp = max_complementarity(candidates[i], new_seq)
-            if cp > max_cp_to_set[i]:
-                max_cp_to_set[i] = cp
+        new_seq_arr = encoded_nb[best_idx]
+        _batch_levenshtein_update(encoded_nb, new_seq_arr, min_ld_to_set, selected_mask, n_cand)
+        _batch_complementarity_update(encoded_nb, new_seq_arr, max_cp_to_set, selected_mask, n_cand, _COMP_TABLE)
 
     return selected_indices, (global_min_hd, global_min_ld, global_max_cp)
 
@@ -272,9 +379,9 @@ def evaluate_set_hd(encoded, indices):
     return min_hd
 
 
-def evaluate_set_full(candidates, indices):
+def evaluate_set_full(candidates, indices, primer_cp=None):
     """Evaluate a barcode set with the full objective.
-    Returns (min_hd, min_ld, max_cp, mean_hd, mean_ld, mean_cp) tuple."""
+    Returns (min_hd, min_ld, max_cp, max_primer_cp, mean_hd, mean_ld, mean_cp, mean_primer_cp) tuple."""
     seqs = [candidates[i] for i in indices]
     n = len(seqs)
     min_hd = 999
@@ -299,8 +406,16 @@ def evaluate_set_full(candidates, indices):
             sum_ld += ld
             sum_cp += cp
             count += 1
-    return (min_hd, min_ld, max_cp,
-            sum_hd / count, sum_ld / count, sum_cp / count)
+    # Primer complementarity metrics
+    if primer_cp is not None:
+        pcp_vals = [int(primer_cp[i]) for i in indices]
+        max_pcp = max(pcp_vals)
+        mean_pcp = sum(pcp_vals) / len(pcp_vals)
+    else:
+        max_pcp = 0
+        mean_pcp = 0.0
+    return (min_hd, min_ld, max_cp, max_pcp,
+            sum_hd / count, sum_ld / count, sum_cp / count, mean_pcp)
 
 
 def score_is_better(new_score, old_score):
@@ -329,135 +444,232 @@ def compute_pair_metrics_for_idx(seq, other_seqs):
 
 
 def score_to_scalar(score):
-    """Convert (min_hd, min_ld, max_cp, mean_hd, mean_ld, mean_cp) to a scalar.
+    """Convert score tuple to a scalar.
+    Score: (min_hd, min_ld, max_cp, max_primer_cp, mean_hd, mean_ld, mean_cp, mean_primer_cp)
     Weights ensure strict lexicographic priority:
-      min_HD >> min_LD >> max_CP >> mean_HD >> mean_LD >> mean_CP
+      min_HD >> min_LD >> max_CP >> max_primer_CP >> mean_HD >> mean_LD >> mean_CP >> mean_primer_CP
     Higher scalar = better."""
-    min_hd, min_ld, max_cp, mean_hd, mean_ld, mean_cp = score
+    min_hd, min_ld, max_cp, max_pcp, mean_hd, mean_ld, mean_cp, mean_pcp = score
     return (10000.0 * min_hd
             + 100.0 * min_ld
             - 10.0 * max_cp
+            - 5.0 * max_pcp
             + 1.0 * mean_hd
             + 0.5 * mean_ld
-            - 0.1 * mean_cp)
+            - 0.1 * mean_cp
+            - 0.05 * mean_pcp)
 
 
-def simulated_annealing(candidates, initial_indices, encoded,
-                        iterations=50000, t_start=5.0, t_end=0.01,
-                        seed=None):
-    """Simulated annealing optimizer for barcode set selection.
-
-    Objective: maximize min_HD, then maximize min_LD, then minimize max_CP.
-
-    Key features:
-      - Targeted swaps: 50% of the time, swap a barcode involved in the worst
-        (bottleneck) pair instead of a random one.
-      - Incremental evaluation: only recomputes the N-1 pairs involving the
-        swapped position.
-      - Cached bottleneck tracking with numpy arrays for fast min/max.
-
-    Args:
-        candidates: list of all candidate barcode sequences
-        initial_indices: starting set of selected candidate indices (from greedy)
-        encoded: numpy-encoded candidate sequences for fast HD
-        iterations: number of SA iterations
-        t_start: starting temperature
-        t_end: ending temperature
-        seed: random seed
-    """
+def tabu_lns_search(candidates, initial_indices, encoded,
+                    iterations=10000, seed=None, primer_cp=None, encoded_nb=None):
+    """Tabu Search with Large Neighborhood Search (LNS) optimizer."""
     rng = random.Random(seed)
+    np_rng = np.random.RandomState(seed if seed is not None else random.randint(0, 2**31 - 1))
     n_cand = len(candidates)
     n_sel = len(initial_indices)
     n_pairs = n_sel * (n_sel - 1) // 2
 
-    # Cooling schedule: geometric
-    alpha = (t_end / t_start) ** (1.0 / max(iterations - 1, 1))
-
-    # Initialize selected set
     selected = list(initial_indices)
+    selected_np = np.array(selected, dtype=np.int32)
     selected_set = set(selected)
 
-    # Use numpy arrays for pairwise metrics (faster min/max than dicts)
-    # Map pair (i,j) where i<j to a flat index: idx = i*n_sel - i*(i+1)//2 + j - i - 1
     def pair_idx(i, j):
         a, b = (i, j) if i < j else (j, i)
         return a * n_sel - a * (a + 1) // 2 + b - a - 1
+
+    # Precompute reverse index: flat_idx -> (i, j)
+    reverse_pair = np.empty((n_pairs, 2), dtype=np.int32)
+    for i in range(n_sel):
+        for j in range(i + 1, n_sel):
+            pidx = pair_idx(i, j)
+            reverse_pair[pidx, 0] = i
+            reverse_pair[pidx, 1] = j
 
     hd_arr = np.zeros(n_pairs, dtype=np.int16)
     ld_arr = np.zeros(n_pairs, dtype=np.int16)
     cp_arr = np.zeros(n_pairs, dtype=np.int16)
 
+    # Initialize pairwise metrics using numba
     for i in range(n_sel):
-        si = candidates[selected[i]]
+        si = encoded_nb[selected[i]]
         for j in range(i + 1, n_sel):
-            sj = candidates[selected[j]]
+            sj = encoded_nb[selected[j]]
             pidx = pair_idx(i, j)
-            hd_arr[pidx] = hamming(si, sj)
-            ld_arr[pidx] = levenshtein(si, sj)
-            cp_arr[pidx] = max_complementarity(si, sj)
+            hd_arr[pidx] = hamming_nb(si, sj)
+            ld_arr[pidx] = levenshtein_nb(si, sj)
+            cp_arr[pidx] = max_complementarity_nb(si, sj, _COMP_TABLE)
 
-    # Build a mask for each position: which pair indices involve that position
-    pos_masks = []
+    # Build pair index lists per position
+    pos_pair_indices = []
     for p in range(n_sel):
-        mask = np.zeros(n_pairs, dtype=bool)
+        indices = []
         for j in range(n_sel):
             if j != p:
-                mask[pair_idx(p, j)] = True
-        pos_masks.append(mask)
+                indices.append(pair_idx(p, j))
+        pos_pair_indices.append(np.array(indices, dtype=np.int32))
 
-    # Running sums for fast mean computation
+    # Precompute non-pos boolean masks
+    pos_not_pair_mask = []
+    for p in range(n_sel):
+        mask = np.ones(n_pairs, dtype=np.bool_)
+        mask[pos_pair_indices[p]] = False
+        pos_not_pair_mask.append(mask)
+
     sum_hd = int(np.sum(hd_arr))
     sum_ld = int(np.sum(ld_arr))
     sum_cp = int(np.sum(cp_arr))
 
+    if primer_cp is not None:
+        sel_primer_cp = np.array([primer_cp[selected[i]] for i in range(n_sel)], dtype=np.int16)
+        sum_primer_cp = int(np.sum(sel_primer_cp))
+    else:
+        sel_primer_cp = np.zeros(n_sel, dtype=np.int16)
+        sum_primer_cp = 0
+
+    # --- Approximate min HD tracking ---
+    approx_min_hd = np.full(n_cand, 999, dtype=np.int16)
+    for idx in selected:
+        hd = np.sum(encoded != encoded[idx], axis=1).astype(np.int16)
+        np.minimum(approx_min_hd, hd, out=approx_min_hd)
+    for idx in selected_set:
+        approx_min_hd[idx] = -1
+
+    def refresh_approx_min_hd():
+        nonlocal approx_min_hd
+        approx_min_hd[:] = 999
+        for idx in selected:
+            hd = np.sum(encoded != encoded[idx], axis=1).astype(np.int16)
+            np.minimum(approx_min_hd, hd, out=approx_min_hd)
+        for idx in selected_set:
+            approx_min_hd[idx] = -1
+
+    def update_approx_after_swap(old_idx, new_idx):
+        nonlocal approx_min_hd
+        approx_min_hd[new_idx] = -1
+        hd = np.sum(encoded != encoded[new_idx], axis=1).astype(np.int16)
+        np.minimum(approx_min_hd, hd, out=approx_min_hd)
+        approx_min_hd[new_idx] = -1  # re-mark after minimum
+        hd_to_sel = np.sum(encoded[selected] != encoded[old_idx], axis=1)
+        approx_min_hd[old_idx] = int(np.min(hd_to_sel))
+
+    # --- Adaptive parameters ---
+    tabu_tenure = max(10, n_sel // 4)
+    n_eval = 30
+    lns_interval = max(100, iterations // 30)
+    lns_destroy_k = max(3, min(8, n_sel // 12))
+    hd_refresh_interval = max(50, iterations // 100)
+    max_no_improve = max(2000, iterations // 5)
+
+    # Tabu list: candidate_idx -> iteration when tabu expires
+    tabu = {}
+
+    def get_screened_candidates(n_top):
+        top_k = min(n_top, int(np.sum(approx_min_hd > 0)))
+        if top_k <= 0:
+            return np.array([], dtype=np.int32)
+        return np.argpartition(approx_min_hd, -top_k)[-top_k:]
+
     def get_score():
-        return (int(np.min(hd_arr)), int(np.min(ld_arr)), int(np.max(cp_arr)),
-                sum_hd / n_pairs, sum_ld / n_pairs, sum_cp / n_pairs)
+        max_pcp = int(np.max(sel_primer_cp)) if primer_cp is not None else 0
+        mean_pcp = sum_primer_cp / n_sel if primer_cp is not None else 0.0
+        return (int(np.min(hd_arr)), int(np.min(ld_arr)), int(np.max(cp_arr)), max_pcp,
+                sum_hd / n_pairs, sum_ld / n_pairs, sum_cp / n_pairs, mean_pcp)
 
     def find_bottleneck_positions():
-        """Find positions involved in the worst pairs (lowest HD, then lowest LD, then highest CP)."""
+        """Find positions involved in the worst pairs using precomputed reverse index."""
         positions = set()
-        # Find pair(s) with minimum HD
         min_hd = int(np.min(hd_arr))
-        hd_worst = np.where(hd_arr == min_hd)[0]
-        for pidx in hd_worst[:5]:  # Limit to avoid too many
-            # Reverse map flat index to (i,j)
-            for i in range(n_sel):
-                for j in range(i + 1, n_sel):
-                    if pair_idx(i, j) == pidx:
-                        positions.add(i)
-                        positions.add(j)
-                        break
-                else:
-                    continue
-                break
-        # Also find pair(s) with minimum LD
+        for pidx in np.where(hd_arr == min_hd)[0][:5]:
+            positions.add(int(reverse_pair[pidx, 0]))
+            positions.add(int(reverse_pair[pidx, 1]))
         min_ld = int(np.min(ld_arr))
-        ld_worst = np.where(ld_arr == min_ld)[0]
-        for pidx in ld_worst[:5]:
-            for i in range(n_sel):
-                for j in range(i + 1, n_sel):
-                    if pair_idx(i, j) == pidx:
-                        positions.add(i)
-                        positions.add(j)
-                        break
-                else:
-                    continue
-                break
-        # Also highest CP
+        for pidx in np.where(ld_arr == min_ld)[0][:5]:
+            positions.add(int(reverse_pair[pidx, 0]))
+            positions.add(int(reverse_pair[pidx, 1]))
         max_cp = int(np.max(cp_arr))
-        cp_worst = np.where(cp_arr == max_cp)[0]
-        for pidx in cp_worst[:5]:
-            for i in range(n_sel):
-                for j in range(i + 1, n_sel):
-                    if pair_idx(i, j) == pidx:
-                        positions.add(i)
-                        positions.add(j)
-                        break
-                else:
-                    continue
-                break
+        for pidx in np.where(cp_arr == max_cp)[0][:5]:
+            positions.add(int(reverse_pair[pidx, 0]))
+            positions.add(int(reverse_pair[pidx, 1]))
         return list(positions)
+
+    def fmt_score(s):
+        base = f"HD>={s[0]} LD>={s[1]} CP<={s[2]}"
+        if s[3] > 0:
+            base += f" PCP<={s[3]}"
+        base += f" avgHD={s[4]:.2f} avgLD={s[5]:.2f} avgCP={s[6]:.2f}"
+        if s[7] > 0:
+            base += f" avgPCP={s[7]:.2f}"
+        return base
+
+    def apply_swap(pos, new_cand_idx, new_hd_vals, new_ld_vals, new_cp_vals):
+        """Apply a swap at position pos, replacing selected[pos] with new_cand_idx.
+        Updates all mutable state. Returns old_cand_idx."""
+        nonlocal sum_hd, sum_ld, sum_cp, sum_primer_cp
+
+        old_cand_idx = selected[pos]
+        pair_indices = pos_pair_indices[pos]
+
+        old_pos_sum_hd = int(np.sum(hd_arr[pair_indices]))
+        old_pos_sum_ld = int(np.sum(ld_arr[pair_indices]))
+        old_pos_sum_cp = int(np.sum(cp_arr[pair_indices]))
+
+        sum_hd = sum_hd - old_pos_sum_hd + int(np.sum(new_hd_vals))
+        sum_ld = sum_ld - old_pos_sum_ld + int(np.sum(new_ld_vals))
+        sum_cp = sum_cp - old_pos_sum_cp + int(np.sum(new_cp_vals))
+
+        selected_set.discard(old_cand_idx)
+        selected_set.add(new_cand_idx)
+        selected[pos] = new_cand_idx
+        selected_np[pos] = new_cand_idx
+
+        if primer_cp is not None:
+            new_pcp_val = int(primer_cp[new_cand_idx])
+            sum_primer_cp = sum_primer_cp - int(sel_primer_cp[pos]) + new_pcp_val
+            sel_primer_cp[pos] = new_pcp_val
+
+        for k, pidx in enumerate(pair_indices):
+            hd_arr[pidx] = new_hd_vals[k]
+            ld_arr[pidx] = new_ld_vals[k]
+            cp_arr[pidx] = new_cp_vals[k]
+
+        return old_cand_idx
+
+    def compute_score_for_swap(pos, new_hd_vals, new_ld_vals, new_cp_vals,
+                               non_pos_min_hd, non_pos_min_ld, non_pos_max_cp,
+                               old_sum_hd, old_sum_ld, old_sum_cp, new_cand_idx):
+        """Compute score for a candidate swap using pre-computed position values."""
+        new_min_hd = min(non_pos_min_hd, int(np.min(new_hd_vals)))
+        new_min_ld = min(non_pos_min_ld, int(np.min(new_ld_vals)))
+        new_max_cp = max(non_pos_max_cp, int(np.max(new_cp_vals)))
+
+        new_pos_sum_hd = int(np.sum(new_hd_vals))
+        new_pos_sum_ld = int(np.sum(new_ld_vals))
+        new_pos_sum_cp = int(np.sum(new_cp_vals))
+
+        cand_sum_hd = sum_hd - old_sum_hd + new_pos_sum_hd
+        cand_sum_ld = sum_ld - old_sum_ld + new_pos_sum_ld
+        cand_sum_cp = sum_cp - old_sum_cp + new_pos_sum_cp
+
+        if primer_cp is not None:
+            new_pcp_val = int(primer_cp[new_cand_idx])
+            old_pcp_val = int(sel_primer_cp[pos])
+            cand_sum_pcp = sum_primer_cp - old_pcp_val + new_pcp_val
+            cur_max_pcp = int(np.max(sel_primer_cp))
+            if old_pcp_val == cur_max_pcp:
+                temp_pcp = sel_primer_cp.copy()
+                temp_pcp[pos] = new_pcp_val
+                cand_max_pcp = int(np.max(temp_pcp))
+            else:
+                cand_max_pcp = max(cur_max_pcp, new_pcp_val)
+            cand_mean_pcp = cand_sum_pcp / n_sel
+        else:
+            cand_max_pcp = 0
+            cand_mean_pcp = 0.0
+
+        cand_score = (new_min_hd, new_min_ld, new_max_cp, cand_max_pcp,
+                      cand_sum_hd / n_pairs, cand_sum_ld / n_pairs,
+                      cand_sum_cp / n_pairs, cand_mean_pcp)
+        return cand_score, score_to_scalar(cand_score)
 
     current_score = get_score()
     current_scalar = score_to_scalar(current_score)
@@ -465,137 +677,234 @@ def simulated_annealing(candidates, initial_indices, encoded,
     best_scalar = current_scalar
     best_selected = list(selected)
 
-    # Precompute list of unselected indices for fast sampling
-    unselected = list(set(range(n_cand)) - selected_set)
-
     accepted = 0
     improved = 0
-    temp = t_start
+    lns_count = 0
+    lns_improved = 0
+    last_improve_it = 0
     log_interval = max(1, iterations // 20)
-    bottleneck_positions = find_bottleneck_positions()
-    bottleneck_refresh = max(1, iterations // 100)
-
-    def fmt_score(s):
-        return f"HD>={s[0]} LD>={s[1]} CP<={s[2]} avgHD={s[3]:.2f} avgLD={s[4]:.2f} avgCP={s[5]:.2f}"
 
     print(f"    Initial: {fmt_score(current_score)} (scalar={current_scalar:.1f})")
 
     for it in range(iterations):
-        # Refresh bottleneck positions periodically
-        if it % bottleneck_refresh == 0:
-            bottleneck_positions = find_bottleneck_positions()
+        # Early termination
+        if it - last_improve_it > max_no_improve:
+            print(f"    Early stop at iter {it}: no improvement for {max_no_improve} iterations")
+            break
 
-        # 50% targeted swap (bottleneck position), 50% random
-        if rng.random() < 0.5 and bottleneck_positions:
+        # Periodic refresh of approx_min_hd
+        if it > 0 and it % hd_refresh_interval == 0:
+            refresh_approx_min_hd()
+
+        # --- LNS Phase ---
+        if it > 0 and it % lns_interval == 0:
+            lns_count += 1
+
+            # Save state
+            saved_selected = list(selected)
+            saved_selected_np = selected_np.copy()
+            saved_selected_set = set(selected_set)
+            saved_hd_arr = hd_arr.copy()
+            saved_ld_arr = ld_arr.copy()
+            saved_cp_arr = cp_arr.copy()
+            saved_sum_hd = sum_hd
+            saved_sum_ld = sum_ld
+            saved_sum_cp = sum_cp
+            saved_sel_primer_cp = sel_primer_cp.copy()
+            saved_sum_primer_cp = sum_primer_cp
+            saved_approx_min_hd = approx_min_hd.copy()
+            saved_scalar = current_scalar
+
+            # Get bottleneck positions for destruction
+            bottleneck_pos = find_bottleneck_positions()
+            destroy_positions = list(bottleneck_pos[:lns_destroy_k])
+            # Pad with random positions if needed
+            if len(destroy_positions) < lns_destroy_k:
+                remaining = [p for p in range(n_sel) if p not in destroy_positions]
+                rng.shuffle(remaining)
+                need = lns_destroy_k - len(destroy_positions)
+                destroy_positions.extend(remaining[:need])
+
+            # Sequentially replace each destroyed position with best candidate
+            for d_pos in destroy_positions:
+                screened = get_screened_candidates(n_eval * 3)
+                if len(screened) == 0:
+                    continue
+                if len(screened) > n_eval * 3:
+                    screened = np_rng.choice(screened, size=n_eval * 3, replace=False)
+
+                # Pre-compute position-dependent values ONCE
+                not_pos_mask = pos_not_pair_mask[d_pos]
+                non_pos_min_hd_v = int(np.min(hd_arr[not_pos_mask])) if n_pairs > n_sel - 1 else 999
+                non_pos_min_ld_v = int(np.min(ld_arr[not_pos_mask])) if n_pairs > n_sel - 1 else 999
+                non_pos_max_cp_v = int(np.max(cp_arr[not_pos_mask])) if n_pairs > n_sel - 1 else 0
+                d_pair_indices = pos_pair_indices[d_pos]
+                old_sum_hd_v = int(np.sum(hd_arr[d_pair_indices]))
+                old_sum_ld_v = int(np.sum(ld_arr[d_pair_indices]))
+                old_sum_cp_v = int(np.sum(cp_arr[d_pair_indices]))
+
+                best_ci = -1
+                best_ci_scalar = -1e18
+                best_ci_hd_vals = None
+                best_ci_ld_vals = None
+                best_ci_cp_vals = None
+                best_ci_score = None
+
+                for ci in screened:
+                    ci = int(ci)
+                    if ci in selected_set:
+                        continue
+                    new_seq_arr = encoded_nb[ci]
+                    hd_v, ld_v, cp_v = _sa_compute_new_pairs(
+                        encoded_nb, new_seq_arr, selected_np, d_pos, n_sel, _COMP_TABLE)
+                    cand_score, cand_scalar = compute_score_for_swap(
+                        d_pos, hd_v, ld_v, cp_v,
+                        non_pos_min_hd_v, non_pos_min_ld_v, non_pos_max_cp_v,
+                        old_sum_hd_v, old_sum_ld_v, old_sum_cp_v, ci)
+                    if cand_scalar > best_ci_scalar:
+                        best_ci_scalar = cand_scalar
+                        best_ci = ci
+                        best_ci_hd_vals = hd_v
+                        best_ci_ld_vals = ld_v
+                        best_ci_cp_vals = cp_v
+                        best_ci_score = cand_score
+
+                if best_ci >= 0:
+                    old_cand = apply_swap(d_pos, best_ci, best_ci_hd_vals, best_ci_ld_vals, best_ci_cp_vals)
+                    update_approx_after_swap(old_cand, best_ci)
+                    current_score = best_ci_score
+                    current_scalar = best_ci_scalar
+
+            # Check if LNS improved
+            current_score = get_score()
+            current_scalar = score_to_scalar(current_score)
+
+            if current_scalar > saved_scalar:
+                # Keep the LNS result
+                lns_improved += 1
+                accepted += 1
+                if current_scalar > best_scalar:
+                    best_score = current_score
+                    best_scalar = current_scalar
+                    best_selected = list(selected)
+                    improved += 1
+                    last_improve_it = it
+            else:
+                # Restore state
+                selected[:] = saved_selected
+                selected_np[:] = saved_selected_np
+                selected_set.clear()
+                selected_set.update(saved_selected_set)
+                hd_arr[:] = saved_hd_arr
+                ld_arr[:] = saved_ld_arr
+                cp_arr[:] = saved_cp_arr
+                sum_hd = saved_sum_hd
+                sum_ld = saved_sum_ld
+                sum_cp = saved_sum_cp
+                sel_primer_cp[:] = saved_sel_primer_cp
+                sum_primer_cp = saved_sum_primer_cp
+                approx_min_hd[:] = saved_approx_min_hd
+                current_score = get_score()
+                current_scalar = saved_scalar
+
+            if (it + 1) % log_interval == 0 or it == 0:
+                print(f"    iter {it+1:>6}/{iterations}: "
+                      f"cur=({fmt_score(current_score)})  "
+                      f"best=scalar={best_scalar:.1f}  "
+                      f"accepted={accepted} improved={improved} "
+                      f"LNS={lns_count}/{lns_improved}")
+            continue
+
+        # --- Regular Tabu Swap ---
+        bottleneck_positions = find_bottleneck_positions()
+
+        if rng.random() < 0.7 and bottleneck_positions:
             pos = rng.choice(bottleneck_positions)
         else:
             pos = rng.randint(0, n_sel - 1)
 
-        old_cand_idx = selected[pos]
+        # Pre-compute position-dependent values ONCE per position
+        not_pos_mask = pos_not_pair_mask[pos]
+        non_pos_min_hd = int(np.min(hd_arr[not_pos_mask])) if n_pairs > n_sel - 1 else 999
+        non_pos_min_ld = int(np.min(ld_arr[not_pos_mask])) if n_pairs > n_sel - 1 else 999
+        non_pos_max_cp = int(np.max(cp_arr[not_pos_mask])) if n_pairs > n_sel - 1 else 0
+        pair_indices = pos_pair_indices[pos]
+        old_sum_hd_pos = int(np.sum(hd_arr[pair_indices]))
+        old_sum_ld_pos = int(np.sum(ld_arr[pair_indices]))
+        old_sum_cp_pos = int(np.sum(cp_arr[pair_indices]))
 
-        # Pick a random unselected candidate to swap in
-        unsel_pos = rng.randint(0, len(unselected) - 1)
-        new_cand_idx = unselected[unsel_pos]
-        new_seq = candidates[new_cand_idx]
+        # Screen candidates
+        screened = get_screened_candidates(n_eval * 2)
+        if len(screened) == 0:
+            continue
+        if len(screened) > n_eval:
+            screened = np_rng.choice(screened, size=n_eval, replace=False)
 
-        # Compute new pair metrics for position `pos` with all others
-        pos_mask = pos_masks[pos]
-        not_pos_mask = ~pos_mask
+        best_ci = -1
+        best_ci_scalar = -1e18
+        best_ci_hd_vals = None
+        best_ci_ld_vals = None
+        best_ci_cp_vals = None
+        best_ci_score = None
 
-        new_hd_vals = np.empty(n_sel - 1, dtype=np.int16)
-        new_ld_vals = np.empty(n_sel - 1, dtype=np.int16)
-        new_cp_vals = np.empty(n_sel - 1, dtype=np.int16)
-        pair_indices = []  # flat indices for the pairs involving pos
-        k = 0
-        for j in range(n_sel):
-            if j == pos:
+        for ci in screened:
+            ci = int(ci)
+            if ci in selected_set:
                 continue
-            pidx = pair_idx(pos, j)
-            pair_indices.append(pidx)
-            other_seq = candidates[selected[j]]
-            new_hd_vals[k] = hamming(new_seq, other_seq)
-            new_ld_vals[k] = levenshtein(new_seq, other_seq)
-            new_cp_vals[k] = max_complementarity(new_seq, other_seq)
-            k += 1
 
-        # Compute new global score incrementally using numpy
-        # non-pos metrics
-        non_pos_min_hd = int(np.min(hd_arr[not_pos_mask])) if np.any(not_pos_mask) else 999
-        non_pos_min_ld = int(np.min(ld_arr[not_pos_mask])) if np.any(not_pos_mask) else 999
-        non_pos_max_cp = int(np.max(cp_arr[not_pos_mask])) if np.any(not_pos_mask) else 0
+            is_tabu = ci in tabu and tabu[ci] > it
+            new_seq_arr = encoded_nb[ci]
+            hd_v, ld_v, cp_v = _sa_compute_new_pairs(
+                encoded_nb, new_seq_arr, selected_np, pos, n_sel, _COMP_TABLE)
+            cand_score, cand_scalar = compute_score_for_swap(
+                pos, hd_v, ld_v, cp_v,
+                non_pos_min_hd, non_pos_min_ld, non_pos_max_cp,
+                old_sum_hd_pos, old_sum_ld_pos, old_sum_cp_pos, ci)
 
-        new_min_hd = min(non_pos_min_hd, int(np.min(new_hd_vals)))
-        new_min_ld = min(non_pos_min_ld, int(np.min(new_ld_vals)))
-        new_max_cp = max(non_pos_max_cp, int(np.max(new_cp_vals)))
+            # Accept if non-tabu OR aspiration criterion (better than best known)
+            if is_tabu and cand_scalar <= best_scalar:
+                continue
 
-        # Incremental mean: subtract old pos-pair sums, add new
-        old_pos_sum_hd = int(np.sum(hd_arr[pos_mask]))
-        old_pos_sum_ld = int(np.sum(ld_arr[pos_mask]))
-        old_pos_sum_cp = int(np.sum(cp_arr[pos_mask]))
-        new_pos_sum_hd = int(np.sum(new_hd_vals))
-        new_pos_sum_ld = int(np.sum(new_ld_vals))
-        new_pos_sum_cp = int(np.sum(new_cp_vals))
+            if cand_scalar > best_ci_scalar:
+                best_ci_scalar = cand_scalar
+                best_ci = ci
+                best_ci_hd_vals = hd_v
+                best_ci_ld_vals = ld_v
+                best_ci_cp_vals = cp_v
+                best_ci_score = cand_score
 
-        new_sum_hd = sum_hd - old_pos_sum_hd + new_pos_sum_hd
-        new_sum_ld = sum_ld - old_pos_sum_ld + new_pos_sum_ld
-        new_sum_cp = sum_cp - old_pos_sum_cp + new_pos_sum_cp
+        if best_ci < 0:
+            continue
 
-        new_score = (new_min_hd, new_min_ld, new_max_cp,
-                     new_sum_hd / n_pairs, new_sum_ld / n_pairs, new_sum_cp / n_pairs)
-        new_scalar = score_to_scalar(new_score)
+        # Always accept best move (tabu search)
+        old_cand_idx = apply_swap(pos, best_ci, best_ci_hd_vals, best_ci_ld_vals, best_ci_cp_vals)
 
-        # Acceptance decision
-        delta = new_scalar - current_scalar
-        accept = False
-        if delta > 0:
-            accept = True
-        elif temp > 0 and delta > -50:  # Clip very bad moves
-            prob = math.exp(delta / temp)
-            if rng.random() < prob:
-                accept = True
+        # Add old barcode to tabu
+        tabu[old_cand_idx] = it + tabu_tenure
 
-        if accept:
-            # Apply the swap
-            selected_set.discard(old_cand_idx)
-            selected_set.add(new_cand_idx)
-            selected[pos] = new_cand_idx
+        # Update approx_min_hd
+        update_approx_after_swap(old_cand_idx, best_ci)
 
-            # Update unselected list
-            unselected[unsel_pos] = old_cand_idx
+        current_score = best_ci_score
+        current_scalar = best_ci_scalar
+        accepted += 1
 
-            # Update running sums
-            sum_hd = new_sum_hd
-            sum_ld = new_sum_ld
-            sum_cp = new_sum_cp
+        if current_scalar > best_scalar:
+            best_score = current_score
+            best_scalar = current_scalar
+            best_selected = list(selected)
+            improved += 1
+            last_improve_it = it
 
-            # Update pair metric arrays
-            for k, pidx in enumerate(pair_indices):
-                hd_arr[pidx] = new_hd_vals[k]
-                ld_arr[pidx] = new_ld_vals[k]
-                cp_arr[pidx] = new_cp_vals[k]
-
-            current_score = new_score
-            current_scalar = new_scalar
-            accepted += 1
-
-            # Track best
-            if score_is_better(new_score, best_score):
-                best_score = new_score
-                best_scalar = new_scalar
-                best_selected = list(selected)
-                improved += 1
-
-        # Cool
-        temp *= alpha
-
-        # Logging
         if (it + 1) % log_interval == 0 or it == 0:
-            print(f"    iter {it+1:>6}/{iterations}: T={temp:.3f}  "
+            print(f"    iter {it+1:>6}/{iterations}: "
                   f"cur=({fmt_score(current_score)})  "
                   f"best=scalar={best_scalar:.1f}  "
-                  f"accepted={accepted} improved={improved}")
+                  f"accepted={accepted} improved={improved} "
+                  f"LNS={lns_count}/{lns_improved}")
 
-    print(f"\n    SA complete: {accepted} accepted, {improved} improvements")
+    print(f"\n    Tabu-LNS complete: {accepted} accepted, {improved} improvements, "
+          f"{lns_count} LNS phases ({lns_improved} improved)")
     print(f"    Best: {fmt_score(best_score)} (scalar={best_scalar:.1f})")
     return best_selected, best_score
 
@@ -614,14 +923,13 @@ def main():
                         help='Maximum allowed dinucleotide repeat count (default: 2)')
     parser.add_argument('--restarts', type=int, default=3,
                         help='Number of random restarts for greedy initialization (default: 3)')
-    parser.add_argument('--sa-iterations', type=int, default=50000,
-                        help='Simulated annealing iterations (default: 50000)')
-    parser.add_argument('--sa-temp', type=float, default=5.0,
-                        help='SA starting temperature (default: 5.0)')
-    parser.add_argument('--sa-cool', type=float, default=0.01,
-                        help='SA ending temperature (default: 0.01)')
+    parser.add_argument('--iterations', type=int, default=10000,
+                        help='Tabu-LNS search iterations (default: 10000)')
     parser.add_argument('--seed', type=int, default=None,
                         help='Random seed for reproducibility')
+    parser.add_argument('--primers', type=str, default=None,
+                        help='Primer sequences to avoid (comma-separated DNA sequences). '
+                             'Barcodes with high complementarity to these primers will be penalized.')
     parser.add_argument('-o', '--output', type=str, default=None,
                         help='Output file for barcode list (CSV)')
     args = parser.parse_args()
@@ -638,15 +946,30 @@ def main():
     gc_min = gc_count_min / args.length
     gc_max = gc_count_max / args.length
 
+    # Parse primer sequences
+    primers = []
+    if args.primers:
+        for p in args.primers.split(','):
+            p = p.strip().upper()
+            if p and all(c in 'ACGT' for c in p):
+                primers.append(p)
+            elif p:
+                print(f"WARNING: Ignoring invalid primer sequence '{p}' (must contain only A, C, G, T)")
+        if not primers:
+            print("WARNING: No valid primer sequences provided, ignoring --primers")
+
     print(f"=== Barcode Optimizer ===")
     print(f"  Barcode length:    {args.length} nt")
     print(f"  Target count:      {args.num_barcodes}")
     print(f"  GC range:          {gc_min*100:.1f}% - {gc_max*100:.1f}%")
     print(f"  Max homopolymer:   {args.max_homopolymer}")
     print(f"  Max dinuc repeat:  {args.max_dinuc_repeat}")
+    if primers:
+        print(f"  Primer blacklist:  {len(primers)} sequences")
+        for p in primers:
+            print(f"    {p} ({len(p)} nt)")
     print(f"  Greedy restarts:   {args.restarts}")
-    print(f"  SA iterations:     {args.sa_iterations}")
-    print(f"  SA temp range:     {args.sa_temp} -> {args.sa_cool}")
+    print(f"  Tabu-LNS iters:    {args.iterations}")
     print()
 
     # Step 1: Generate candidate pool
@@ -666,46 +989,77 @@ def main():
         print(f"ERROR: Only {len(candidates)} candidates available, cannot select {args.num_barcodes}.")
         sys.exit(1)
 
+    # Precompute primer complementarity for all candidates
+    primer_cp_arr = None
+    if primers:
+        print("Computing primer complementarity for all candidates...", end=" ", flush=True)
+        t_pcp = time.time()
+        primer_cp_arr = np.array([compute_primer_complementarity(c, primers) for c in candidates], dtype=np.int16)
+        print(f"done in {time.time()-t_pcp:.1f}s (max={int(np.max(primer_cp_arr))}, mean={np.mean(primer_cp_arr):.1f})")
+
     # Step 2: Encode for fast distance computation
     print("Encoding sequences...", end=" ", flush=True)
     encoded = compute_distance_matrix(candidates)
+    # Also create int8 array for numba functions
+    encoded_nb = np.array([[_BASE_MAP[c] for c in seq] for seq in candidates], dtype=np.int8)
     print("done")
+
+    # Warm up numba JIT (first call triggers compilation)
+    print("JIT compiling numba kernels...", end=" ", flush=True)
+    t_jit = time.time()
+    _dummy = np.array([0, 1, 2, 3], dtype=np.int8)
+    hamming_nb(_dummy, _dummy)
+    levenshtein_nb(_dummy, _dummy)
+    max_complementarity_nb(_dummy, _dummy, _COMP_TABLE)
+    _batch_levenshtein_update(encoded_nb[:2], encoded_nb[0], np.full(2, 999, dtype=np.int16), np.zeros(2, dtype=np.bool_), 2)
+    _batch_complementarity_update(encoded_nb[:2], encoded_nb[0], np.zeros(2, dtype=np.int16), np.zeros(2, dtype=np.bool_), 2, _COMP_TABLE)
+    _sa_compute_new_pairs(encoded_nb[:2], encoded_nb[0], np.array([0, 1], dtype=np.int32), 0, 2, _COMP_TABLE)
+    print(f"done in {time.time()-t_jit:.1f}s")
 
     # Step 3: Greedy initialization
     print(f"\nPhase 1: Greedy initialization ({args.restarts} restarts)...")
     base_seed = args.seed if args.seed is not None else random.randint(0, 999999)
 
     best_indices = None
-    best_score = (-1, -1, 999, 0.0, 0.0, 999.0)  # (min_hd, min_ld, max_cp, mean_hd, mean_ld, mean_cp)
+    best_score = (-1, -1, 999, 999, 0.0, 0.0, 999.0, 999.0)
+
+    def fmt_main_score(s):
+        base = f"HD>={s[0]} LD>={s[1]} CP<={s[2]}"
+        if s[3] > 0:
+            base += f" PCP<={s[3]}"
+        base += f" avgHD={s[4]:.2f} avgLD={s[5]:.2f} avgCP={s[6]:.2f}"
+        if s[7] > 0:
+            base += f" avgPCP={s[7]:.2f}"
+        return base
+
+    def _run_greedy_restart(r):
+        seed = base_seed + r
+        indices, _ = greedy_select(candidates, encoded, args.num_barcodes, seed=seed, primer_cp=primer_cp_arr, encoded_nb=encoded_nb)
+        score = evaluate_set_full(candidates, indices, primer_cp=primer_cp_arr)
+        return r, indices, score
 
     for r in range(args.restarts):
-        seed = base_seed + r
-        indices, _ = greedy_select(candidates, encoded, args.num_barcodes, seed=seed)
-        # Compute full 6-element score including means
-        score = evaluate_set_full(candidates, indices)
+        r_num, indices, score = _run_greedy_restart(r)
         improved = ""
         if score_is_better(score, best_score):
             best_score = score
             best_indices = indices
             improved = " << NEW BEST"
-        print(f"  Restart {r+1:>3}/{args.restarts}: HD>={score[0]} LD>={score[1]} CP<={score[2]} "
-              f"avgHD={score[3]:.2f} avgLD={score[4]:.2f} avgCP={score[5]:.2f}{improved}")
+        print(f"  Restart {r_num+1:>3}/{args.restarts}: {fmt_main_score(score)}{improved}")
 
-    print(f"  Greedy best: HD>={best_score[0]} LD>={best_score[1]} CP<={best_score[2]} "
-          f"avgHD={best_score[3]:.2f} avgLD={best_score[4]:.2f} avgCP={best_score[5]:.2f}")
+    print(f"  Greedy best: {fmt_main_score(best_score)}")
 
-    # Step 4: Simulated annealing refinement
-    print(f"\nPhase 2: Simulated annealing ({args.sa_iterations} iterations)...")
-    sa_seed = base_seed + args.restarts
-    refined_indices, refined_score = simulated_annealing(
+    # Step 4: Tabu-LNS refinement
+    print(f"\nPhase 2: Tabu-LNS search ({args.iterations} iterations)...")
+    tabu_seed = base_seed + args.restarts
+    refined_indices, refined_score = tabu_lns_search(
         candidates, best_indices, encoded,
-        iterations=args.sa_iterations,
-        t_start=args.sa_temp,
-        t_end=args.sa_cool,
-        seed=sa_seed,
+        iterations=args.iterations,
+        seed=tabu_seed,
+        primer_cp=primer_cp_arr,
+        encoded_nb=encoded_nb,
     )
-    print(f"\n  Final: HD>={refined_score[0]} LD>={refined_score[1]} CP<={refined_score[2]} "
-          f"avgHD={refined_score[3]:.2f} avgLD={refined_score[4]:.2f} avgCP={refined_score[5]:.2f}")
+    print(f"\n  Final: {fmt_main_score(refined_score)}")
 
     # Step 5: Collect and display results
     selected = [candidates[i] for i in refined_indices]
@@ -786,6 +1140,28 @@ def main():
         print(f"  {'-'*40}")
         for i, j, s1, s2, hd, ld, cp in sorted(low_ld, key=lambda x: x[5]):
             print(f"  {i:<5} {s1:<10} {j:<5} {s2:<10} {hd:>3} {ld:>3}")
+
+    # --- Primer Complementarity ---
+    if primers:
+        print(f"\n  PRIMER COMPLEMENTARITY (non-specific binding risk)")
+        pcp_vals = [compute_primer_complementarity(s, primers) for s in selected]
+        print(f"  Max primer complementarity: {max(pcp_vals)} bp")
+        print(f"  Mean primer complementarity: {sum(pcp_vals)/len(pcp_vals):.2f} bp")
+        pcp_counter = Counter(pcp_vals)
+        print(f"  Distribution:")
+        for pcp_val in sorted(pcp_counter.keys()):
+            print(f"    PCP={pcp_val}: {pcp_counter[pcp_val]:>5} barcodes")
+        # Flag high primer complementarity barcodes
+        pcp_threshold = max(4, int(min(len(p) for p in primers) * 0.6))
+        high_pcp = [(idx+1, s, pcp) for idx, (s, pcp) in enumerate(zip(selected, pcp_vals)) if pcp >= pcp_threshold]
+        if high_pcp:
+            print(f"\n  WARNING: {len(high_pcp)} barcodes with primer complementarity >= {pcp_threshold} bp:")
+            print(f"  {'BC':<5} {'Barcode':<10} {'PCP':>4}")
+            print(f"  {'-'*22}")
+            for bc_idx, seq, pcp in sorted(high_pcp, key=lambda x: -x[2])[:20]:
+                print(f"  {bc_idx:<5} {seq:<10} {pcp:>4}")
+        else:
+            print(f"\n  No barcodes with primer complementarity >= {pcp_threshold} bp. Low non-specific binding risk.")
 
     # --- GC Content ---
     gc_vals = [gc_content(s) * 100 for s in selected]

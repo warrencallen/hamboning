@@ -12,17 +12,6 @@ Additional constraints (configurable):
 - No dinucleotide repeats >= 3
 - Optional primer complementarity minimization
 
-## How It Works
-
-1. **Candidate generation**: Enumerates all valid barcodes meeting GC, homopolymer, and dinucleotide constraints.
-2. **Greedy initialization**: Multiple random restarts of a greedy algorithm that selects barcodes maximizing minimum pairwise distance.
-3. **Tabu-LNS refinement**: A Tabu Search with Large Neighborhood Search optimizer that refines the greedy solution:
-   - Evaluates multiple HD-screened candidates per swap (best-move strategy)
-   - Tabu list prevents cycling without temperature tuning
-   - Periodic LNS phases destroy bottleneck barcodes and greedily rebuild, escaping local optima
-   - Early termination when converged
-
-Core distance functions (Hamming, Levenshtein, complementarity) are JIT-compiled with Numba for near-C performance.
 
 ## Requirements
 
